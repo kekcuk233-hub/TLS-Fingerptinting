@@ -29,5 +29,12 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+#Codex learning
+.codex
+.concept-loom
+AGENTS.md
+learning/
+
