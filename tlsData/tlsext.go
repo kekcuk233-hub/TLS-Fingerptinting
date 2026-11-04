@@ -3,7 +3,7 @@
 //
 // Источник: https://www.iana.org/assignments/tls-extensiontype-values/
 // (реестр tls-extensiontype-values-1, состояние на 2026-10-08).
-package tlsext
+package tlsdata
 
 import (
 	"encoding/binary"

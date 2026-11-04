@@ -9,7 +9,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
-	tlsext "github.com/kekcuk233-hub/TLS-Fingerptinting/package"
+	tlsext "github.com/kekcuk233-hub/TLS-Fingerptinting/tlsData"
 )
 
 func printExtensions(exts []byte) error {
@@ -43,6 +43,7 @@ func main() {
 	}
 	defer f.Close()
 
+	//Нужно добавить новые функции для чтения новых файлов pcapng
 	r, err := pcapgo.NewReader(f)
 	if err != nil {
 		fmt.Printf("Pcap error: %v\n", err)
@@ -154,12 +155,9 @@ func main() {
 
 		fmt.Println("--------JA4--------")
 		a_part, _, err := tlsext.JA4(payload[9:])
-
 		if err != nil {
-			fmt.Printf("Error during ja4 formatting: %v\n", err)
-			return
+			fmt.Println("Error: ", err)
 		}
-
 		fmt.Println("a_part: ", a_part)
 
 	}
