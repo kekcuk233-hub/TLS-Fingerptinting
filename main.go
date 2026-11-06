@@ -158,7 +158,7 @@ func main() {
 		if err != nil {
 			fmt.Println("Error: ", err)
 		}
-		fmt.Println("a_part: ", a_part)
+		fmt.Println("JA4 = ", a_part)
 
 	}
 

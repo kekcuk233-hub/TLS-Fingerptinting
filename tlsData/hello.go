@@ -1,9 +1,6 @@
 package tlsdata
 
-import (
-	"encoding/binary"
-	"fmt"
-)
+import "encoding/binary"
 
 type extension struct {
 	tp uint16
@@ -11,12 +8,11 @@ type extension struct {
 }
 
 // Хранит в себе все данные clientHello
-// ciphers без Grease
-// extensions с Grease
+// в исходном значении и с GREASE
 type clientHello struct {
 	version    uint16
-	ciphers    []uint16    // Без Grease
-	extensions []extension // С Grease
+	ciphers    []uint16
+	extensions []extension
 }
 
 // Собираем данные для ClientHello
@@ -46,9 +42,7 @@ func parseClientHello(data []byte) (*clientHello, error) {
 
 	//Добавляем шифры
 	for i := 0; i < len(cs); i += 2 {
-		if c := binary.BigEndian.Uint16(cs[i:]); !IsGREASE(c) {
-			h.ciphers = append(h.ciphers, c)
-		}
+		h.ciphers = append(h.ciphers, binary.BigEndian.Uint16(cs[i:]))
 	}
 
 	//Добавляем расширения
@@ -56,7 +50,6 @@ func parseClientHello(data []byte) (*clientHello, error) {
 	for len(er.b) > 0 {
 		tp := er.u16()
 		body := er.take(int(er.u16()))
-		fmt.Printf("%#x\n", body)
 
 		if er.err != nil {
 			return nil, er.err
