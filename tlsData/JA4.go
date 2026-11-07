@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -35,100 +34,141 @@ func ja4Version(v uint16) string {
 	return "00"
 }
 
-func sha256_12(data string) string {
-	hash := sha256.Sum256([]byte(data))
-	result := hex.EncodeToString(hash[:])
-
-	return result[:12]
+// Какие символы содержатся в названии протокола.
+// По спецификации RFC 7301, ALPN содержит ASCII-символы.
+func isAlnum(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
 }
 
-// Получение JA4. Возращает ja4, ja4_raw, error
-func JA4(data []byte) (string, string, error) {
+// Получение значения alpn - первый и последний символ первого протокола
+// 2 длина массива -> 1 длина протокола -> 2 протокол
+func getALPN(body []byte) string {
+	if len(body) < 0 || (int(binary.BigEndian.Uint16(body)) != len(body)-2) {
+		return "00"
+	}
+
+	list := body[2:]
+	if len(list) == 0 {
+		return "00"
+	}
+
+	n := int(list[1])
+	if n > len(list)-1 {
+		return "00"
+	}
+
+	first, last := list[1], list[n]
+
+	if isAlnum(first) && isAlnum(last) {
+		return string([]byte{first, last})
+	}
+
+	h := hex.EncodeToString(list[1 : 1+n])
+	return string([]byte{h[0], h[n]})
+}
+
+func sha256_12(data string) string {
+	if data == "" {
+		return "000000000000"
+	}
+
+	hash := sha256.Sum256([]byte(data))
+
+	return hex.EncodeToString(hash[:])[:12]
+}
+
+func hexString(v []uint16) string {
+	s := make([]string, 0, len(v))
+	for _, x := range v {
+		s = append(s, fmt.Sprintf("%04x", x))
+	}
+	return strings.Join(s, ",")
+}
+
+// JA4 принимает тело handshake-сообщения ClientHello (после 4-байтного заголовка
+// handshake) и возвращает отпечаток JA4: Hash — "a_хеш(b)_хеш(c)", Raw — то же
+// со списками вместо хешей.
+func JA4(data []byte) (Fingerprint, error) {
+	return ja4('t', data)
+}
+
+// ja4 принимает символ протокола ('t', 'q', 'd'): для TCP, QUIC и DTLS
+// Пока только с TCP
+func ja4(proto byte, data []byte) (Fingerprint, error) {
 	ch, err := parseClientHello(data)
 	if err != nil {
-		return "", "", err
+		return Fingerprint{}, err
 	}
 
-	amount_of_ciphers := len(ch.ciphers)
-	amount_of_extensions := len(ch.extensions)
+	//Получаем все шифры, убираем GREASE и сортируем
+	ciphers := withoutGrease(ch.ciphers) // Обязательно делаем копию
+	slices.Sort(ciphers)
 
-	max_supported_group := uint16(0)
-	sni := "i"
-	var alpn string
+	// Все необходимые переменные для работы с расширениями
+	var (
+		extCount int      // Количество расширений с SNI и ALPN
+		extForC  []uint16 // Все типы расширений без SNI и ALPN
+		signAlg  []uint16 // Алгоритмы подписи в исходном порядке
+		maxVer   uint16
+		sni      = byte('i')
+		alpn     = "00"
+	)
+
 	for _, ext := range ch.extensions {
-		if ext.tp == 0 {
-			sni = "d"
+		if IsGREASE(ext.tp) {
+			continue
 		}
 
-		if ext.tp == 16 {
-			size := uint16(ext.b[2]) // Пропускаем общий размер и выбираем размер первого
-			alpn = string(ext.b[3]) + strconv.Itoa(int(ext.b[size]))
+		extCount++
+		if ext.tp != 0x0000 && ext.tp != 0x0010 {
+			extForC = append(extForC, ext.tp)
 		}
 
-		if ext.tp == 43 { // 43 - supported versions
-			for i := 1; i < len(ext.b); i += 2 { // i = 1, чтобы пропустить размер
-				current_version := binary.BigEndian.Uint16(ext.b[i:])
-				if current_version > max_supported_group && !IsGREASE(current_version) {
-					max_supported_group = current_version
-				}
+		switch ext.tp {
+		case 0x0000:
+			sni = 'd'
+		case 0x0010:
+			alpn = getALPN(ext.b)
+		case 0x002b:
+			supVer, err := listOf(ext.b, 1, 2)
+			if err != nil {
+				return Fingerprint{}, err
+			}
+
+			supVer = withoutGrease(supVer)
+
+			for _, x := range supVer {
+				maxVer = max(maxVer, x)
+			}
+		case 0x000d:
+			if signAlg, err = listOf(ext.b, 2, 2); err != nil {
+				return Fingerprint{}, err
 			}
 		}
+
 	}
 
-	//Соединить все для части а
-	a_part := "t" +
-		ja4Version(max_supported_group) +
-		sni + strconv.Itoa(amount_of_ciphers) +
-		strconv.Itoa(amount_of_extensions) +
-		alpn
+	slices.Sort(extForC)
+	signAlg = withoutGrease(signAlg)
 
-	//Часть b - sha256 от отсортированных шифров через запятую
-	sorted_ciphers := ch.ciphers
-	slices.Sort(sorted_ciphers)
-	var b_part strings.Builder
-	for i, c := range sorted_ciphers {
-		if i < amount_of_ciphers-1 {
-			fmt.Fprintf(&b_part, "%04x,", c)
-		} else {
-			fmt.Fprintf(&b_part, "%04x", c) // В конце без ","
-		}
+	// Если нет supported_groups берем из ClientHello
+	version := ch.version
+	if maxVer != 0 {
+		version = maxVer
 	}
 
-	// С Часть
-	var c_ext []uint16
-	var sign_alg strings.Builder
-	for _, ext := range ch.extensions {
-		if ext.tp != 00 && ext.tp != 16 {
-			c_ext = append(c_ext, ext.tp)
-		}
-		// add signature algorithms
-		if ext.tp == 13 {
-			for i := 2; i < len(ext.b); i += 2 {
-				if d := binary.BigEndian.Uint16(ext.b[i:]); !IsGREASE(d) {
-					if i < len(ext.b)-2 {
-						fmt.Fprintf(&sign_alg, "%04x,", d)
-					} else {
-						fmt.Fprintf(&sign_alg, "%04x", d)
-					}
+	a := fmt.Sprintf("%c%s%c%02d%02d%s",
+		proto, ja4Version(version), sni, min(len(ciphers), 99), min(extCount, 99), alpn)
 
-				}
+	b := hexString(ciphers)
 
-			}
-		}
+	c := hexString(extForC)
+	if c != "" && len(signAlg) > 0 { // "_" только если есть алгоритмы подписи
+		c += "_" + hexString(signAlg)
 	}
 
-	var ext_str strings.Builder
-	slices.Sort(c_ext)
-	for i, ext := range c_ext {
-		if i < len(c_ext)-1 {
-			fmt.Fprintf(&ext_str, "%04x,", ext)
-		} else {
-			fmt.Fprintf(&ext_str, "%04x_", ext)
-		}
-		fmt.Println("ext: ", ext)
-	}
-
-	c_part := ext_str.String() + sign_alg.String()
-
-	return (a_part + "_" + sha256_12(b_part.String()) + "_" + sha256_12(c_part)), "", nil
+	return Fingerprint{
+		Hash: a + "_" + sha256_12(b) + "_" + sha256_12(c),
+		Raw:  a + "_" + b + "_" + c,
+	}, nil
 }
