@@ -6,6 +6,7 @@ func IsGrease(v uint16) bool {
 	return v&0x0F0F == 0x0A0A && v>>8 == v&0xFF
 }
 
+// Возвращает новый срез без GREASE
 func withoutGrease(data []uint16) []uint16 {
 	arr := make([]uint16, 0, len(data))
 	for _, x := range data {

@@ -43,7 +43,7 @@ func isAlnum(b byte) bool {
 // Получение значения alpn - первый и последний символ первого протокола
 // 2 длина массива -> 1 длина протокола -> 2 протокол
 func getALPN(body []byte) string {
-	if len(body) < 0 || (int(binary.BigEndian.Uint16(body)) != len(body)-2) {
+	if len(body) < 2 || (int(binary.BigEndian.Uint16(body)) != len(body)-2) {
 		return "00"
 	}
 
@@ -52,7 +52,7 @@ func getALPN(body []byte) string {
 		return "00"
 	}
 
-	n := int(list[1])
+	n := int(list[0])
 	if n > len(list)-1 {
 		return "00"
 	}
@@ -88,18 +88,13 @@ func hexString(v []uint16) string {
 // JA4 принимает тело handshake-сообщения ClientHello (после 4-байтного заголовка
 // handshake) и возвращает отпечаток JA4: Hash — "a_хеш(b)_хеш(c)", Raw — то же
 // со списками вместо хешей.
-func JA4(data []byte) (Fingerprint, error) {
-	return ja4('t', data)
+func JA4(ch *clientHello) (Fingerprint, error) {
+	return ja4('t', ch)
 }
 
 // ja4 принимает символ протокола ('t', 'q', 'd'): для TCP, QUIC и DTLS
 // Пока только с TCP
-func ja4(proto byte, data []byte) (Fingerprint, error) {
-	ch, err := parseClientHello(data)
-	if err != nil {
-		return Fingerprint{}, err
-	}
-
+func ja4(proto byte, ch *clientHello) (Fingerprint, error) {
 	//Получаем все шифры, убираем GREASE и сортируем
 	ciphers := withoutGrease(ch.ciphers) // Обязательно делаем копию
 	slices.Sort(ciphers)
@@ -112,6 +107,7 @@ func ja4(proto byte, data []byte) (Fingerprint, error) {
 		maxVer   uint16
 		sni      = byte('i')
 		alpn     = "00"
+		err      error
 	)
 
 	for _, ext := range ch.extensions {
@@ -127,19 +123,20 @@ func ja4(proto byte, data []byte) (Fingerprint, error) {
 		switch ext.tp {
 		case 0x0000:
 			sni = 'd'
+
 		case 0x0010:
 			alpn = getALPN(ext.b)
+
 		case 0x002b:
 			supVer, err := listOf(ext.b, 1, 2)
 			if err != nil {
 				return Fingerprint{}, err
 			}
-
 			supVer = withoutGrease(supVer)
-
 			for _, x := range supVer {
 				maxVer = max(maxVer, x)
 			}
+
 		case 0x000d:
 			if signAlg, err = listOf(ext.b, 2, 2); err != nil {
 				return Fingerprint{}, err

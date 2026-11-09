@@ -16,7 +16,7 @@ type clientHello struct {
 }
 
 // Собираем данные для ClientHello
-func parseClientHello(data []byte) (*clientHello, error) {
+func ParseClientHello(data []byte) (*clientHello, error) {
 	r := &reader{b: data}
 	h := &clientHello{}
 
@@ -75,12 +75,12 @@ func listOf(body []byte, prefix, size int) ([]uint16, error) {
 	}
 
 	list := body[prefix:]
-	if n != len(list) || n%2 != 0 {
+	if n != len(list) || n%size != 0 {
 		return nil, errShort
 	}
 
 	arr := make([]uint16, 0, n/size)
-	for i := 0; i < n; i += 2 {
+	for i := 0; i < n; i += size {
 		if size == 1 {
 			arr = append(arr, uint16(list[i]))
 		} else {
