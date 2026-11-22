@@ -37,4 +37,5 @@ go.work.sum
 .concept-loom
 AGENTS.md
 learning/
-
+learning*
+CONCEPT_LOOM_AGENTS.md

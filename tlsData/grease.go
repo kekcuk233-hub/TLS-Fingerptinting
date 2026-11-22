@@ -2,7 +2,7 @@ package tlsdata
 
 // Проверяет шаблон 0xNANA, где N — любая тетрада (RFC 8701):
 // 0x0A0A, 0x1A1A, ..., 0xFAFA. Оба байта должны совпадать.
-func IsGrease(v uint16) bool {
+func IsGREASE(v uint16) bool {
 	return v&0x0F0F == 0x0A0A && v>>8 == v&0xFF
 }
 

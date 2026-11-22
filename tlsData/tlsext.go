@@ -107,11 +107,6 @@ func Name(v uint16) string {
 // String позволяет использовать ExtensionType в fmt/log напрямую.
 func (e ExtensionType) String() string { return Name(uint16(e)) }
 
-// isGREASE проверяет шаблон 0xNANA, где N — любая тетрада (RFC 8701).
-func IsGREASE(v uint16) bool {
-	return v&0x0F0F == 0x0A0A && v>>8 == v&0xFF
-}
-
 // ---------------------------------------------------------------------------
 // Справочники значений (реестры IANA)
 // ---------------------------------------------------------------------------
