@@ -232,14 +232,13 @@ func getServerName(data []byte) (string, error) {
 	if size != len(data)-2 {
 		return "", fmt.Errorf("Длина списка %d не совпадает с реальной %d", size, len(data))
 	}
-	server_name_type := string(data[2])
 
 	off := 3
 	server_name_size := int(binary.BigEndian.Uint16(data[off:]))
 	off += 2
 	server_name := fmt.Sprintf("%s", data[off:off+server_name_size])
 
-	return fmt.Sprintf("Тип имени сервера: %s | Имя сервера: %s", server_name_type, server_name), nil
+	return fmt.Sprint(server_name), nil
 
 }
 
@@ -328,4 +327,15 @@ func Decode(t uint16, data []byte) string {
 		return fmt.Sprintf("%s (ошибка разбора: %v)", hexFallback(data), err)
 	}
 	return s
+}
+
+// Переделанная функция для получения имени сервера
+func GetServerName(ch *clientHello) (string, error) {
+	for _, ext := range ch.extensions {
+		switch ext.tp {
+		case 0:
+			return getServerName(ext.b)
+		}
+	}
+	return "", fmt.Errorf("unable to get server name")
 }

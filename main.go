@@ -5,217 +5,323 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	tls "github.com/kekcuk233-hub/TLS-Fingerptinting/tlsData"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/google/gopacket/tcpassembly"
 	"github.com/google/gopacket/tcpassembly/tcpreader"
 )
 
-// Чтобы работать как с pcap, так и с pcapng
+const (
+	recordHeaderLen    = 5
+	handshakeHeaderLen = 4
+	maxRecordLen       = 1 << 14 // TLS лимит, чтобы не ловить большие файлы
+	maxHandshakeLen    = 1 << 16 // ограничение размера для сообщения ClientHello
+
+	flushEvery = 50000           // убирать старые подключения каждый N пакетов
+	flushAge   = 2 * time.Minute // Время простоя без пакетов до закрытия соединения
+)
+
+var (
+	pcapngMagic       = []byte{0x0a, 0x0d, 0x0d, 0x0a}
+	errNotClientHello = errors.New("not a TLS ClientHello")
+)
+
 type packetReader interface {
 	ReadPacketData() ([]byte, gopacket.CaptureInfo, error)
+	LinkType() layers.LinkType
 }
 
+func newPacketReader(br *bufio.Reader) (packetReader, error) {
+	magic, err := br.Peek(len(pcapngMagic))
+	if err != nil {
+		return nil, fmt.Errorf("read file magic: %w", err)
+	}
+
+	if bytes.Equal(magic, pcapngMagic) {
+		r, err := pcapgo.NewNgReader(br, pcapgo.DefaultNgReaderOptions)
+		if err != nil {
+			return nil, fmt.Errorf("pcapng reader: %w", err)
+		}
+		return r, nil
+	}
+
+	r, err := pcapgo.NewReader(br)
+	if err != nil {
+		return nil, fmt.Errorf("pcap reader: %w", err)
+	}
+	return r, nil
+}
+
+type result struct {
+	idx  int
+	text string
+}
+
+type collector struct {
+	mu    sync.Mutex
+	items []result
+}
+
+func (c *collector) add(idx int, text string) {
+	c.mu.Lock()
+	c.items = append(c.items, result{idx, text})
+	c.mu.Unlock()
+}
+
+func (c *collector) writeTo(w io.Writer) {
+	sort.SliceStable(c.items, func(i, j int) bool { return c.items[i].idx < c.items[j].idx })
+	for _, it := range c.items {
+		io.WriteString(w, it.text)
+	}
+}
+
+func validRecordHeader(hdr []byte) bool {
+	if hdr[0] != 0x16 || hdr[1] != 0x03 || hdr[2] > 0x04 {
+		return false
+	}
+	n := int(binary.BigEndian.Uint16(hdr[3:5]))
+	return n >= 1 && n <= maxRecordLen
+}
+
+// readRecord читает TLS handshake record и возвращает тело.
+func readRecord(br *bufio.Reader) ([]byte, error) {
+	hdr := make([]byte, recordHeaderLen)
+	if _, err := io.ReadFull(br, hdr); err != nil {
+		return nil, fmt.Errorf("record header: %w", err)
+	}
+	if !validRecordHeader(hdr) {
+		return nil, errors.New("invalid TLS record header")
+	}
+
+	body := make([]byte, int(binary.BigEndian.Uint16(hdr[3:5])))
+	if _, err := io.ReadFull(br, body); err != nil {
+		return nil, fmt.Errorf("record body: %w", err)
+	}
+	return body, nil
+}
+
+// readClientHello возвращает тело ClientHello (начиная с client_version,
+// без 4-байтового заголовка рукопожатия), при необходимости пересобранное из нескольких записей.
+// Возвращает errNotClientHello, если поток попросту не является ClientHello.
+func readClientHello(br *bufio.Reader) ([]byte, error) {
+	hdr, err := br.Peek(recordHeaderLen)
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, errNotClientHello
+		}
+		return nil, err
+	}
+	if !validRecordHeader(hdr) {
+		return nil, errNotClientHello
+	}
+
+	body, err := readRecord(br)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) < handshakeHeaderLen || body[0] != 0x01 { // 0x01 = ClientHello
+		return nil, errNotClientHello
+	}
+
+	hsLen := int(body[1])<<16 | int(body[2])<<8 | int(body[3])
+	if hsLen > maxHandshakeLen {
+		return nil, fmt.Errorf("ClientHello too large: %d bytes", hsLen)
+	}
+
+	msg := append([]byte(nil), body[handshakeHeaderLen:]...)
+	for len(msg) < hsLen { // Если вдруг он разделён на несколько частей
+		next, err := readRecord(br)
+		if err != nil {
+			return nil, fmt.Errorf("fragmented ClientHello: %w", err)
+		}
+		msg = append(msg, next...)
+	}
+
+	return msg[:hsLen], nil // все после ClientHello отбросить
+}
+
+// ---------- TCP stream handling ----------
+
 type tlsStreamFactory struct {
+	wg   sync.WaitGroup
+	out  *collector
+	next int // обращаются только из `New`, который ассемблер вызывает синхронно
 }
 
 type tlsStream struct {
+	idx            int
 	net, transport gopacket.Flow
 	r              tcpreader.ReaderStream
+	out            *collector
+	wg             *sync.WaitGroup
 }
 
-func (h *tlsStream) streamHandle() {
-	defer io.Copy(io.Discard, &h.r)
+func (f *tlsStreamFactory) New(netFlow, transport gopacket.Flow) tcpassembly.Stream {
+	s := &tlsStream{
+		idx:       f.next,
+		net:       netFlow,
+		transport: transport,
+		r:         tcpreader.NewReaderStream(),
+		out:       f.out,
+		wg:        &f.wg,
+	}
+	s.r.LossErrors = true
+	f.next++
 
-	br := bufio.NewReader(&h.r)
-	hdr, err := br.Peek(5)
-	if err != nil {
-		if errors.Is(err, tcpreader.DataLost) {
-			log.Printf("%v:%v Data loss while reading TLS header", h.net, h.transport)
-		} else {
-			log.Printf("%v:%v TLC header reading error: %v", h.net, h.transport, err)
+	f.wg.Add(1)
+	go s.run()
+
+	return &s.r
+}
+
+// продолжает читать, чтобы не заброкировался поток
+func drain(r io.Reader) {
+	buf := make([]byte, 32*1024)
+	for {
+		if _, err := r.Read(buf); err != nil && !errors.Is(err, tcpreader.DataLost) {
+			return
 		}
+	}
+}
+
+func (s *tlsStream) run() {
+	defer s.wg.Done() // этот будет последним
+	defer drain(&s.r)
+
+	flow := fmt.Sprintf("%v:%v", s.net, s.transport)
+
+	msg, err := readClientHello(bufio.NewReader(&s.r))
+	switch {
+	case err == nil:
+	case errors.Is(err, errNotClientHello):
+		return
+	case errors.Is(err, tcpreader.DataLost):
+		s.out.add(s.idx, flow+": data loss while reading ClientHello\n\n")
+		return
+	default:
+		s.out.add(s.idx, fmt.Sprintf("%s: ClientHello read error: %v\n\n", flow, err))
 		return
 	}
 
-	if hdr[0] != 0x16 {
-		return
-	}
-
-	reclen := int(binary.BigEndian.Uint16(hdr[3:]))
-	rec := make([]byte, 5+reclen) // Длина + 5 байт заголовка
-	if _, err := io.ReadFull(br, rec); err != nil {
-		if errors.Is(err, tcpreader.DataLost) {
-			log.Printf("%v:%v data loss while reading TLS data", h.net, h.transport)
-		} else {
-			log.Printf("%v:%v TLC data reading error: %v", h.net, h.transport, err)
-		}
-
-		return
-	}
-
-	// 5 байт заголовок записи + 4 байта заголовок handshake (тип + длина)
-	if len(rec) < 9 || rec[5] != 0x01 { // 0x01 = ClientHello
-		return
-	}
-
-	ch, err := tls.ParseClientHello(rec[9:])
+	ch, err := tls.ParseClientHello(msg)
 	if err != nil {
-		fmt.Printf("%v:%v: ClientHello parse error: %v\n", h.net, h.transport, err)
+		s.out.add(s.idx, fmt.Sprintf("%s: ClientHello parse error: %v\n\n", flow, err))
 		return
 	}
+
+	serverName, _ := tls.GetServerName(ch)
+
 	ja3, err := tls.JA3(ch)
 	if err != nil {
-		fmt.Printf("%v:%v: JA3 error: %v\n", h.net, h.transport, err)
+		s.out.add(s.idx, fmt.Sprintf("%s: JA3 error: %v\n\n", flow, err))
 		return
 	}
 	ja4, err := tls.JA4(ch)
 	if err != nil {
-		fmt.Printf("%v:%v: JA4 error: %v\n", h.net, h.transport, err)
+		s.out.add(s.idx, fmt.Sprintf("%s: JA4 error: %v\n\n", flow, err))
 		return
 	}
 
-	fmt.Printf("%v:%v\nJa3_raw: %s\nJa3: %s\nJa4_raw: %s\nJa4: %s\n\n",
-		h.net, h.transport, ja3.Raw, ja3.Hash, ja4.Raw, ja4.Hash)
+	// s.out.add(s.idx, fmt.Sprintf("%s\nServer Name: %s\nJa3_raw: %s\nJa3: %s\nJa4_raw: %s\nJa4: %s\n\n",
+	// 	flow, serverName, ja3.Raw, ja3.Hash, ja4.Raw, ja4.Hash))
 
+	s.out.add(s.idx, fmt.Sprintf("%s\nServer Name: %s\nJa3: %s\tJa4: %s\n\n",
+		flow, serverName, ja3.Hash, ja4.Hash))
 }
 
-func (h *tlsStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
-	hStream := &tlsStream{
-		net:       net,
-		transport: transport,
-		r:         tcpreader.NewReaderStream(),
-	}
-	hStream.r.LossErrors = true
-	go hStream.streamHandle() // goroutine
-
-	return &hStream.r
-}
-
-func isPCAPNG(file *os.File) (bool, error) {
-	magic := []byte{0x0a, 0x0d, 0x0d, 0x0a}
-
-	buffer := make([]byte, len(magic))
-
-	if _, err := io.ReadFull(file, buffer); err != nil {
-		return false, err
-	}
-
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return false, err
-	}
-
-	return bytes.Equal(buffer, magic), nil
-}
-
-func openFile(path string) (*os.File, packetReader, error) {
+func processFile(path string, w io.Writer) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("file opening: %w", err)
+		return fmt.Errorf("open file: %w", err)
 	}
+	defer f.Close()
 
-	isNg, err := isPCAPNG(f)
+	r, err := newPacketReader(bufio.NewReaderSize(f, 1<<20))
 	if err != nil {
-		f.Close()
-		return nil, nil, fmt.Errorf("file analyzing: %w", err)
+		return err
 	}
 
-	if isNg {
-		r, err := pcapgo.NewNgReader(f, pcapgo.DefaultNgReaderOptions)
+	out := &collector{}
+	factory := &tlsStreamFactory{out: out}
+	assembler := tcpassembly.NewAssembler(tcpassembly.NewStreamPool(factory))
+
+	var readErr error
+	count := 0
+
+	for {
+		data, ci, err := r.ReadPacketData()
 		if err != nil {
-			f.Close()
-			return nil, nil, fmt.Errorf("PCAPNG reader: %w", err)
+			if !errors.Is(err, io.EOF) {
+				readErr = fmt.Errorf("read packet: %w", err) // обрезанный захват
+			}
+			break
 		}
-		return f, r, nil
-	}
+		count++
 
-	r, err := pcapgo.NewReader(f)
-	if err != nil {
-		f.Close()
-		return nil, nil, fmt.Errorf("PCAP reader: %w", err)
-	}
-
-	return f, r, nil
-}
-
-func processFile(path string) error {
-	// f, r, err := openFile(path)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	return err
-	// }
-	// defer f.Close()
-
-	handle, err := pcap.OpenOffline(path)
-	if err != nil {
-		return fmt.Errorf("Error during offline open: %w", err)
-	}
-
-	streamFactory := &tlsStreamFactory{}
-	streamPool := tcpassembly.NewStreamPool(streamFactory)
-	assembler := tcpassembly.NewAssembler(streamPool)
-
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	packets := packetSource.Packets()
-	for packet := range packets {
-		if packet == nil {
+		pkt := gopacket.NewPacket(data, r.LinkType(), gopacket.DecodeOptions{Lazy: true})
+		netLayer := pkt.NetworkLayer()
+		tcp, ok := pkt.TransportLayer().(*layers.TCP)
+		if netLayer == nil || !ok {
 			continue
 		}
 
-		if packet.NetworkLayer() == nil ||
-			packet.TransportLayer() == nil ||
-			packet.TransportLayer().LayerType() != layers.LayerTypeTCP {
-			//log.Println("Unusable packet")
-			continue
+		assembler.AssembleWithTimestamp(netLayer.NetworkFlow(), tcp, ci.Timestamp)
+
+		if count%flushEvery == 0 {
+			assembler.FlushOlderThan(ci.Timestamp.Add(-flushAge))
 		}
-
-		tcp := packet.TransportLayer().(*layers.TCP)
-
-		assembler.AssembleWithTimestamp(
-			packet.NetworkLayer().NetworkFlow(),
-			tcp,
-			packet.Metadata().Timestamp,
-		)
 	}
 
 	assembler.FlushAll()
-	return nil
+	factory.wg.Wait()
+	out.writeTo(w)
+
+	return readErr
 }
 
 func main() {
-	fmt.Println("----Program Starts----")
+	dir := flag.String("dir", "learning", "directory with .pcap / .pcapng files")
+	flag.Parse()
+
+	entries, err := os.ReadDir(*dir) // отсортированм по имени
+	if err != nil {
+		log.Fatalf("read dir %q: %v", *dir, err)
+	}
 
 	var files []string
-
-	pcap, err := filepath.Glob("learning/*.pcap")
-	if err != nil {
-		fmt.Printf("Error during pcap files searching: %v\n", err)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(e.Name())) {
+		case ".pcap", ".pcapng":
+			files = append(files, filepath.Join(*dir, e.Name()))
+		}
 	}
 
-	pcapng, err := filepath.Glob("learning/*.pcapng")
-	if err != nil {
-		fmt.Printf("Error during pcapng files searching: %v\n", err)
+	if len(files) == 0 {
+		fmt.Printf("no .pcap/.pcapng files found in %q\n", *dir)
+		return
 	}
 
-	files = append(files, pcap...)
-	files = append(files, pcapng...)
-
-	for _, f := range files {
-		fmt.Printf("\n\n-------------%s----------------\n", f)
-
-		err := processFile(f)
-		if err != nil {
-			fmt.Println(err)
+	for _, path := range files {
+		fmt.Printf("\n------------- %s -------------\n", path)
+		if err := processFile(path, os.Stdout); err != nil {
+			fmt.Printf("error: %v\n", err)
 		}
 	}
 }
