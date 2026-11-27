@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -10,17 +10,18 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tls "github.com/kekcuk233-hub/TLS-Fingerptinting/tlsData"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/tcpassembly"
 	"github.com/google/gopacket/tcpassembly/tcpreader"
 )
@@ -28,67 +29,74 @@ import (
 const (
 	recordHeaderLen    = 5
 	handshakeHeaderLen = 4
-	maxRecordLen       = 1 << 14 // TLS лимит, чтобы не ловить большие файлы
-	maxHandshakeLen    = 1 << 16 // ограничение размера для сообщения ClientHello
-
-	flushEvery = 50000           // убирать старые подключения каждый N пакетов
-	flushAge   = 2 * time.Minute // Время простоя без пакетов до закрытия соединения
+	maxRecordLen       = 1 << 14
+	maxHandshakeLen    = 1 << 16
 )
+
+var errNotClientHello = errors.New("not a TLS ClientHello")
+
+// ---------- флаги ----------
 
 var (
-	pcapngMagic       = []byte{0x0a, 0x0d, 0x0d, 0x0a}
-	errNotClientHello = errors.New("not a TLS ClientHello")
+	iface   = flag.String("i", "", "interface for live capture")
+	fname   = flag.String("r", "", "pcap/pcapng file to read (offline)")
+	snaplen = flag.Int("s", 65535, "snap length")
+	filter  = flag.String("f", "tcp", `BPF filter, e.g. "tcp dst port 443"`)
+	promisc = flag.Bool("p", false, "promiscuous mode (live only)")
+	list    = flag.Bool("list", false, "list interfaces and exit")
 )
 
-type packetReader interface {
-	ReadPacketData() ([]byte, gopacket.CaptureInfo, error)
-	LinkType() layers.LinkType
-}
-
-func newPacketReader(br *bufio.Reader) (packetReader, error) {
-	magic, err := br.Peek(len(pcapngMagic))
-	if err != nil {
-		return nil, fmt.Errorf("read file magic: %w", err)
-	}
-
-	if bytes.Equal(magic, pcapngMagic) {
-		r, err := pcapgo.NewNgReader(br, pcapgo.DefaultNgReaderOptions)
-		if err != nil {
-			return nil, fmt.Errorf("pcapng reader: %w", err)
-		}
-		return r, nil
-	}
-
-	r, err := pcapgo.NewReader(br)
-	if err != nil {
-		return nil, fmt.Errorf("pcap reader: %w", err)
-	}
-	return r, nil
-}
+// ---------- sink: единственное место вывода ----------
 
 type result struct {
 	idx  int
 	text string
 }
 
-type collector struct {
-	mu    sync.Mutex
-	items []result
+type sink struct {
+	ch      chan result
+	done    chan struct{}
+	w       io.Writer
+	ordered bool // true: накопить и вывести по порядку в конце (offline)
 }
 
-func (c *collector) add(idx int, text string) {
-	c.mu.Lock()
-	c.items = append(c.items, result{idx, text})
-	c.mu.Unlock()
+func newSink(w io.Writer, ordered bool) *sink {
+	s := &sink{
+		ch:      make(chan result, 256),
+		done:    make(chan struct{}),
+		w:       w,
+		ordered: ordered,
+	}
+	go s.loop()
+	return s
 }
 
-func (c *collector) writeTo(w io.Writer) {
-	sort.SliceStable(c.items, func(i, j int) bool { return c.items[i].idx < c.items[j].idx })
-	for _, it := range c.items {
-		io.WriteString(w, it.text)
+func (s *sink) add(idx int, text string) { s.ch <- result{idx, text} }
+
+func (s *sink) close() {
+	close(s.ch)
+	<-s.done
+}
+
+func (s *sink) loop() {
+	defer close(s.done)
+
+	var buf []result
+	for r := range s.ch {
+		if s.ordered {
+			buf = append(buf, r)
+			continue
+		}
+		io.WriteString(s.w, r.text)
+	}
+
+	sort.SliceStable(buf, func(i, j int) bool { return buf[i].idx < buf[j].idx })
+	for _, r := range buf {
+		io.WriteString(s.w, r.text)
 	}
 }
 
+// ---------- TLS parsing: validRecordHeader, readRecord, readClientHello ----------
 func validRecordHeader(hdr []byte) bool {
 	if hdr[0] != 0x16 || hdr[1] != 0x03 || hdr[2] > 0x04 {
 		return false
@@ -154,19 +162,19 @@ func readClientHello(br *bufio.Reader) ([]byte, error) {
 	return msg[:hsLen], nil // все после ClientHello отбросить
 }
 
-// ---------- TCP stream handling ----------
+// ---------- потоки TCP ----------
 
 type tlsStreamFactory struct {
 	wg   sync.WaitGroup
-	out  *collector
-	next int // обращаются только из `New`, который ассемблер вызывает синхронно
+	out  *sink
+	next int // New вызывается из одной горутины (цикл захвата)
 }
 
 type tlsStream struct {
 	idx            int
 	net, transport gopacket.Flow
 	r              tcpreader.ReaderStream
-	out            *collector
+	out            *sink
 	wg             *sync.WaitGroup
 }
 
@@ -188,7 +196,6 @@ func (f *tlsStreamFactory) New(netFlow, transport gopacket.Flow) tcpassembly.Str
 	return &s.r
 }
 
-// продолжает читать, чтобы не заброкировался поток
 func drain(r io.Reader) {
 	buf := make([]byte, 32*1024)
 	for {
@@ -199,7 +206,7 @@ func drain(r io.Reader) {
 }
 
 func (s *tlsStream) run() {
-	defer s.wg.Done() // этот будет последним
+	defer s.wg.Done()
 	defer drain(&s.r)
 
 	flow := fmt.Sprintf("%v:%v", s.net, s.transport)
@@ -222,9 +229,6 @@ func (s *tlsStream) run() {
 		s.out.add(s.idx, fmt.Sprintf("%s: ClientHello parse error: %v\n\n", flow, err))
 		return
 	}
-
-	serverName, _ := tls.GetServerName(ch)
-
 	ja3, err := tls.JA3(ch)
 	if err != nil {
 		s.out.add(s.idx, fmt.Sprintf("%s: JA3 error: %v\n\n", flow, err))
@@ -236,92 +240,159 @@ func (s *tlsStream) run() {
 		return
 	}
 
-	// s.out.add(s.idx, fmt.Sprintf("%s\nServer Name: %s\nJa3_raw: %s\nJa3: %s\nJa4_raw: %s\nJa4: %s\n\n",
-	// 	flow, serverName, ja3.Raw, ja3.Hash, ja4.Raw, ja4.Hash))
+	sni, _ := tls.GetServerName(ch)
 
-	s.out.add(s.idx, fmt.Sprintf("%s\nServer Name: %s\nJa3: %s\tJa4: %s\n\n",
-		flow, serverName, ja3.Hash, ja4.Hash))
+	s.out.add(s.idx, fmt.Sprintf("%s\nServerName: %s\nJa3_raw: %s\nJa3: %s\nJa4_raw: %s\nJa4: %s\n\n",
+		flow, sni, ja3.Raw, ja3.Hash, ja4.Raw, ja4.Hash))
 }
 
-func processFile(path string, w io.Writer) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open file: %w", err)
-	}
-	defer f.Close()
+// ---------- общий цикл захвата (live и offline) ----------
 
-	r, err := newPacketReader(bufio.NewReaderSize(f, 1<<20))
-	if err != nil {
-		return err
-	}
+type stats struct {
+	packets, notTCP, decodeErr, truncated int
+}
 
-	out := &collector{}
+func capture(ctx context.Context, handle *pcap.Handle, out *sink, live bool) stats {
+	var st stats
+
 	factory := &tlsStreamFactory{out: out}
-	assembler := tcpassembly.NewAssembler(tcpassembly.NewStreamPool(factory))
+	asm := tcpassembly.NewAssembler(tcpassembly.NewStreamPool(factory))
+	asm.MaxBufferedPagesTotal = 100000
+	asm.MaxBufferedPagesPerConnection = 64
 
-	var readErr error
-	count := 0
+	src := gopacket.NewPacketSource(handle, handle.LinkType())
+	src.DecodeOptions.Lazy = true
+	packets := src.Packets()
 
+	var tick <-chan time.Time
+	if live {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		tick = t.C
+	}
+
+loop:
 	for {
-		data, ci, err := r.ReadPacketData()
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				readErr = fmt.Errorf("read packet: %w", err) // обрезанный захват
+		select {
+		case <-ctx.Done():
+			break loop
+		case pkt, ok := <-packets:
+			if !ok {
+				break loop
 			}
-			break
-		}
-		count++
+			st.packets++
 
-		pkt := gopacket.NewPacket(data, r.LinkType(), gopacket.DecodeOptions{Lazy: true})
-		netLayer := pkt.NetworkLayer()
-		tcp, ok := pkt.TransportLayer().(*layers.TCP)
-		if netLayer == nil || !ok {
-			continue
-		}
+			ci := pkt.Metadata().CaptureInfo
+			if ci.CaptureLength < ci.Length {
+				st.truncated++
+			}
+			if pkt.ErrorLayer() != nil {
+				st.decodeErr++
+			}
 
-		assembler.AssembleWithTimestamp(netLayer.NetworkFlow(), tcp, ci.Timestamp)
+			nl := pkt.NetworkLayer()
+			tcp, isTCP := pkt.TransportLayer().(*layers.TCP)
+			if nl == nil || !isTCP {
+				st.notTCP++
+				continue
+			}
 
-		if count%flushEvery == 0 {
-			assembler.FlushOlderThan(ci.Timestamp.Add(-flushAge))
+			asm.AssembleWithTimestamp(nl.NetworkFlow(), tcp, ci.Timestamp)
+		case <-tick:
+			// раз в минуту закрываем соединения без активности 2 минуты
+			asm.FlushOlderThan(time.Now().Add(-2 * time.Minute))
 		}
 	}
 
-	assembler.FlushAll()
+	asm.FlushAll()
 	factory.wg.Wait()
-	out.writeTo(w)
+	return st
+}
 
-	return readErr
+// ---------- main ----------
+
+func openHandle() (h *pcap.Handle, live bool, err error) {
+	if *fname != "" {
+		log.Printf("reading from file %q", *fname)
+		h, err = pcap.OpenOffline(*fname)
+		return h, false, err
+	}
+	log.Printf("capturing on interface %q", *iface)
+	h, err = pcap.OpenLive(*iface, int32(*snaplen), *promisc, time.Second)
+	return h, true, err
+}
+
+func listDevices() {
+	devs, err := pcap.FindAllDevs()
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, d := range devs {
+		fmt.Printf("%s\t%s\n", d.Name, d.Description)
+		for _, a := range d.Addresses {
+			fmt.Printf("\t%v\n", a.IP)
+		}
+	}
+}
+
+func setupLogging(serviceName string) (*os.File, error) {
+	logDir := "logs"
+
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create log dir: %w", err)
+	}
+
+	timestamp := time.Now().Format(time.DateOnly)
+	logPath := filepath.Join(logDir, fmt.Sprintf("%s-%s.log", serviceName, timestamp))
+	return os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 }
 
 func main() {
-	dir := flag.String("dir", "learning", "directory with .pcap / .pcapng files")
 	flag.Parse()
 
-	entries, err := os.ReadDir(*dir) // отсортированм по имени
-	if err != nil {
-		log.Fatalf("read dir %q: %v", *dir, err)
-	}
-
-	var files []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		switch strings.ToLower(filepath.Ext(e.Name())) {
-		case ".pcap", ".pcapng":
-			files = append(files, filepath.Join(*dir, e.Name()))
-		}
-	}
-
-	if len(files) == 0 {
-		fmt.Printf("no .pcap/.pcapng files found in %q\n", *dir)
+	if *list {
+		listDevices()
 		return
 	}
+	if (*iface == "") == (*fname == "") {
+		fmt.Fprintln(os.Stderr, "use exactly one of -i or -r")
+		flag.Usage()
+		os.Exit(2)
+	}
 
-	for _, path := range files {
-		fmt.Printf("\n------------- %s -------------\n", path)
-		if err := processFile(path, os.Stdout); err != nil {
-			fmt.Printf("error: %v\n", err)
+	handle, live, err := openHandle()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer handle.Close()
+
+	logFile, err := setupLogging("liveLog")
+	if err != nil {
+		log.Fatal(err)
+	} else {
+		log.SetOutput(logFile)
+	}
+	defer logFile.Close()
+
+	if *filter != "" {
+		if err := handle.SetBPFFilter(*filter); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	out := newSink(logFile, !live)
+	st := capture(ctx, handle, out, live)
+	out.close()
+
+	log.Printf("packets=%d not_tcp=%d decode_errors=%d truncated=%d",
+		st.packets, st.notTCP, st.decodeErr, st.truncated)
+	if live {
+		if hs, err := handle.Stats(); err == nil {
+			log.Printf("kernel: received=%d dropped=%d if_dropped=%d",
+				hs.PacketsReceived, hs.PacketsDropped, hs.PacketsIfDropped)
 		}
 	}
 }
